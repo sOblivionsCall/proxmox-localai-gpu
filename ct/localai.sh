@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Proxmox VE LXC installer — LocalAI with GPU passthrough (optional)
+# Proxmox VE LXC installer — LocalAI (binary; CPU and GPU)
 #
 # Modeled on community-scripts/ProxmoxVE (MIT): this is the "ct/*.sh"
 # host-side launcher. It creates the LXC, then delegates to
 # install/localai-install.sh inside the container.
 #
-# GPU handling: the community-scripts ENGINE handles GPU passthrough itself
-# (detect_gpu_devices() + configure_gpu_passthrough() + fix_gpu_gids() run
-# inside create_lxc_container() when var_gpu=yes). We only set var_gpu and
-# warn about a missing host driver — we do NOT hand-append device mounts,
-# which previously raced and conflicted with the engine's own config writes.
+# Philosophy: the installer provides the working platform — OS, device
+# passthrough (when a GPU exists), the LocalAI binary, and model configs.
+# Configuring LocalAI itself is up to the user (drop YAMLs into
+# /opt/localai/models).
+#
+# GPU handling: the community-scripts ENGINE performs GPU passthrough itself
+# (detect_gpu_devices + configure_gpu_passthrough + fix_gpu_gids) when
+# var_gpu=yes. We set var_gpu based on host detection and stay out of the way.
 #
 # Run from the Proxmox HOST shell:
 #   bash -c "$(wget -qLO - https://raw.githubusercontent.com/sOblivionsCall/proxmox-localai-gpu/main/ct/localai.sh)"
@@ -27,10 +30,6 @@ var_ram="${var_ram:-8192}"
 var_disk="${var_disk:-40}"
 var_os="${var_os:-ubuntu}"
 var_version="${var_version:-24.04}"
-# Nesting is required: the docker deployment path runs Docker inside the LXC.
-var_nesting="${var_nesting:-1}"
-# Keyctl is required for Docker in unprivileged containers.
-var_keyctl="${var_keyctl:-1}"
 
 # ----------------------------------------------------------------------------
 # GPU detection (host-side, before container creation)
@@ -123,60 +122,19 @@ pre_install_gpu_check() {
   fi
 }
 
-# In-container GPU sanity check runs INSIDE the LXC (via pct exec) after
-# creation — that's where a device-mount failure actually shows up, not at
-# container creation time.
-# (The engine's fix_gpu_gids() runs inside create_lxc_container() for us.)
-
 # ==============================================================================
 # UPDATE SUPPORT
 # ==============================================================================
 # Re-running the ct script on a host where the LocalAI LXC already exists
 # routes here instead of creating a duplicate. Matches the community-scripts
-# update_script() convention (called by build_container() / post-install
-# helper "Apply updates").
+# update_script() convention.
 localai_installed_in_ct() {
-  pct exec "$CTID" -- bash -c 'systemctl is-active --quiet localai 2>/dev/null || docker ps --format "{{.Names}}" 2>/dev/null | grep -qx localai' >/dev/null 2>&1
+  pct exec "$CTID" -- bash -c 'systemctl is-active --quiet localai 2>/dev/null' >/dev/null 2>&1
 }
 
 update_container() {
-  msg_info "Updating LocalAI inside CT ${CTID}"
-  # DEPLOY_MODE is persisted by the installer into /opt/localai/deploy-mode
-  local MODE
-  MODE=$(pct exec "$CTID" -- bash -c 'cat /opt/localai/deploy-mode 2>/dev/null || echo docker') || MODE="docker"
-  msg_info "Detected deployment mode: ${MODE}"
-
-  if [[ "$MODE" == "docker" ]]; then
-    msg_info "Pulling latest LocalAI image"
-    pct exec "$CTID" -- docker pull localai/localai:latest-aio-gpu-nvidia-cuda-13 || {
-      msg_error "Image pull failed — check connectivity / disk space"
-      exit 250
-    }
-    msg_ok "New image pulled"
-    msg_info "Recreating container"
-    pct exec "$CTID" -- systemctl restart localai
-    msg_ok "Container recreated from the new image"
-  else
-    msg_info "Re-downloading LocalAI binary"
-    pct exec "$CTID" -- bash -c 'DEPLOY_MODE=binary LOCALAI_VERSION=latest bash -s' <<'UPDATE_BINARY'
-set -e
-ARCH=$(uname -m)
-case "$ARCH" in
-  x86_64)  LA_OS="Linux";  LA_ARCH="x86_64"  ;;
-  aarch64) LA_OS="Linux";  LA_ARCH="arm64"   ;;
-  *) echo "unsupported arch $ARCH"; exit 1 ;;
-esac
-TAG=$(curl -fsSL https://api.github.com/repos/mudler/LocalAI/releases/latest | jq -r '.tag_name')
-[[ -z "$TAG" || "$TAG" == "null" ]] && { echo "could not resolve latest"; exit 1; }
-DL_URL="https://github.com/mudler/LocalAI/releases/download/${TAG}/local-ai-${LA_OS}-${LA_ARCH}"
-curl -fsSL "$DL_URL" -o /usr/local/bin/local-ai.new && chmod +x /usr/local/bin/local-ai.new
-mv /usr/local/bin/local-ai.new /usr/local/bin/local-ai
-systemctl restart localai
-echo "updated to ${TAG}"
-UPDATE_BINARY
-    msg_ok "Binary updated and service restarted"
-  fi
-
+  msg_info "Updating LocalAI inside CT ${CTID} (binary mode)"
+  pct exec "$CTID" -- bash /opt/localai/update.sh
   sleep 8
   if pct exec "$CTID" -- systemctl is-active --quiet localai; then
     msg_ok "LocalAI is running after update"
@@ -203,8 +161,7 @@ pre_install_gpu_check
 build_container
 description
 
-# Ship the in-container updater now that the container exists (needs
-# /opt/localai from the installer) — the installer persisted deploy-mode.
+# Ship the in-container updater now that the container exists.
 if pct exec "$CTID" -- test -f /opt/localai/deploy-mode >/dev/null 2>&1; then
   pct push "$CTID" "$(cd "$(dirname "${BASH_SOURCE[0]}")/../install" && pwd)/localai-update.sh" /opt/localai/update.sh >/dev/null 2>&1 && \
     pct exec "$CTID" -- chmod +x /opt/localai/update.sh >/dev/null 2>&1 && \
@@ -216,7 +173,7 @@ echo -e "${CREATING}${GN}${APP} LXC created — LocalAI is installed and running
 if [[ "$HOST_GPU" == "none" ]]; then
   echo -e "${INFO}${YW}Mode:${CL} CPU-only (unprivileged container)"
 else
-  echo -e "${INFO}${YW}Mode:${CL} GPU-accelerated ($HOST_GPU)"
+  echo -e "${INFO}${YW}Mode:${CL} GPU passthrough via the installer engine ($HOST_GPU)"
 fi
 echo -e "${INFO}${YW}LocalAI API:${CL} ${GATEWAY}${BGN}http://${IP}:8080/v1${CL}"
 echo -e "${INFO}${YW}Models directory on the container:${CL} ${BGN}/opt/localai/models${CL}"
