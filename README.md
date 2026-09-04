@@ -19,13 +19,13 @@ The installer auto-detects hardware and picks the mode; you can also force it (s
 ## Quick install (one-liner, Proxmox host shell)
 
 ```bash
-bash -c "$(wget -qLO - https://raw.githubusercontent.com/<YOUR-USER>/proxmox-localai-gpu/main/ct/localai.sh)"
+bash -c "$(wget -qLO - https://raw.githubusercontent.com/sOblivionsCall/proxmox-localai-gpu/main/ct/localai.sh)"
 ```
 
 Or clone first:
 
 ```bash
-git clone https://github.com/<YOUR-USER>/proxmox-localai-gpu.git
+git clone https://github.com/sOblivionsCall/proxmox-localai-gpu.git
 cd proxmox-localai-gpu
 bash ct/localai.sh
 ```
