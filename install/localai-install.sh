@@ -198,6 +198,12 @@ EOF
   msg_ok "localai.service enabled (docker: ${IMAGE})"
 }
 
+# Persist the deployment mode — the updater reads it to know which path to run.
+write_deploy_mode() {
+  echo "$DEPLOY_MODE" > "$LOCALAI_DIR/deploy-mode"
+  msg_ok "Deployment mode persisted: ${DEPLOY_MODE}"
+}
+
 # ----------------------------------------------------------------------------
 # Binary path: model configs + native systemd service
 # ----------------------------------------------------------------------------
@@ -276,6 +282,9 @@ case "$DEPLOY_MODE" in
     exit 250
     ;;
 esac
+
+# Persist deployment mode + ship the in-container updater
+write_deploy_mode
 
 # ----------------------------------------------------------------------------
 # Verification

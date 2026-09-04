@@ -6,10 +6,11 @@
 # host-side launcher. It creates the LXC, then delegates to
 # install/localai-install.sh inside the container.
 #
-# GPU handling:
-#   - Auto: detects NVIDIA/AMD on the host and wires device mounts.
-#   - No GPU found (or GPU=no): creates an unprivileged CPU-only container.
-#     LocalAI runs CPU inference — slower but fully functional.
+# GPU handling: the community-scripts ENGINE handles GPU passthrough itself
+# (detect_gpu_devices() + configure_gpu_passthrough() + fix_gpu_gids() run
+# inside create_lxc_container() when var_gpu=yes). We only set var_gpu and
+# warn about a missing host driver — we do NOT hand-append device mounts,
+# which previously raced and conflicted with the engine's own config writes.
 #
 # Run from the Proxmox HOST shell:
 #   bash -c "$(wget -qLO - https://raw.githubusercontent.com/sOblivionsCall/proxmox-localai-gpu/main/ct/localai.sh)"
@@ -26,6 +27,10 @@ var_ram="${var_ram:-8192}"
 var_disk="${var_disk:-40}"
 var_os="${var_os:-ubuntu}"
 var_version="${var_version:-24.04}"
+# Nesting is required: the docker deployment path runs Docker inside the LXC.
+var_nesting="${var_nesting:-1}"
+# Keyctl is required for Docker in unprivileged containers.
+var_keyctl="${var_keyctl:-1}"
 
 # ----------------------------------------------------------------------------
 # GPU detection (host-side, before container creation)
@@ -51,8 +56,9 @@ if [[ "$HOST_GPU" == "none" ]]; then
   var_gpu="no"
   var_unprivileged="${var_unprivileged:-1}"
 else
+  # Engine picks up var_gpu=yes and runs its own configure_gpu_passthrough()
+  # + fix_gpu_gids() inside create_lxc_container().
   var_gpu="yes"
-  # Privileged by default for GPU passthrough (device cgroup + bind mounts).
   var_unprivileged="${var_unprivileged:-0}"
 fi
 
@@ -106,76 +112,107 @@ pre_install_gpu_check() {
       [[ "$reply" =~ ^[Yy]$ ]] || exit 201
     fi
   fi
-}
-
-# ------------------------------------------------------------------------------
-# GPU device mounts. MUST run before build_container(): the engine's
-# build_container() both creates the container AND runs the in-container
-# installer, so devices have to be in the config before that call. Also
-# configures var_gpu/var_unprivileged for build.func's container settings.
-# ------------------------------------------------------------------------------
-configure_gpu_passthrough() {
-  # CPU-only containers: nothing to mount, unprivileged is correct.
-  [[ "$HOST_GPU" == "none" ]] && return 0
-
-  # Build.func applies var_gpu=... during variables()/build_container() on
-  # the current shell state — but the community-scripts engine additionally
-  # recognizes var_gpu_instance-style settings only through its own paths.
-  # The reliable cross-version approach is direct config appends + a restart
-  # of the (already-created) container, which happens below in post-mount.
-  local CTConf="/etc/pve/lxc/${CTID}.conf"
-  msg_info "Configuring GPU passthrough for CT ${CTID}"
-  if [[ "$HOST_GPU" == "nvidia" ]]; then
-    cat <<EOF >>"$CTConf"
-# NVIDIA GPU passthrough (added by proxmox-localai-gpu)
-lxc.cgroup2.devices.allow: c 195:* rwm
-lxc.cgroup2.devices.allow: c 234:* rwm
-lxc.mount.entry: /dev/nvidia0 dev/nvidia0 none bind,optional,create=file
-lxc.mount.entry: /dev/nvidiactl dev/nvidiactl none bind,optional,create=file
-lxc.mount.entry: /dev/nvidia-uvm dev/nvidia-uvm none bind,optional,create=file
-lxc.mount.entry: /dev/nvidia-uvm-tools dev/nvidia-uvm-tools none bind,optional,create=file
-lxc.mount.entry: /dev/nvidia-modeset dev/nvidia-modeset none bind,optional,create=file
-EOF
-    msg_ok "NVIDIA device mounts added"
-    # Ensure UVM exists at host boot even before first CUDA client.
-    if command -v crontab >/dev/null 2>&1; then
-      (crontab -l 2>/dev/null; echo '@reboot /usr/bin/nvidia-modprobe -u -c=0') | crontab - >/dev/null 2>&1 || true
-    fi
-  elif [[ "$HOST_GPU" == "amd" ]]; then
-    cat <<EOF >>"$CTConf"
-# AMD GPU passthrough (added by proxmox-localai-gpu)
-lxc.cgroup2.devices.allow: c 226:* rwm
-lxc.mount.entry: /dev/kfd dev/kfd none bind,optional,create=file
-lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir
-EOF
-    msg_ok "AMD /dev/kfd + /dev/dri mounts added"
+  # Ensure UVM devices exist on the host before container creation — the
+  # classic silent failure where /dev/nvidia-uvm doesn't exist until the
+  # first CUDA client touches it.
+  if [[ "$HOST_GPU" == "nvidia" ]] && command -v nvidia-modprobe >/dev/null 2>&1; then
+    nvidia-modprobe -u -c=0 >/dev/null 2>&1 || true
+  fi
+  if [[ "$HOST_GPU" == "nvidia" ]] && command -v crontab >/dev/null 2>&1; then
+    (crontab -l 2>/dev/null; echo '@reboot /usr/bin/nvidia-modprobe -u -c=0') | crontab - >/dev/null 2>&1 || true
   fi
 }
 
-# Mounts + restart must happen BEFORE build_container() so the installer
-# inside the container can already see the GPU (nvidia-smi checks, CUDA).
-pre_create_gpu_mounts() {
-  [[ "$HOST_GPU" == "none" ]] && { msg_ok "CPU-only container — no device mounts needed"; return 0; }
-  configure_gpu_passthrough
-  # Restart so the newly added mounts/cgroup rules take effect. The engine's
-  # build_container() starts the container; our config edits need a restart
-  # to apply. If the container doesn't exist yet (first run), this is a no-op.
-  if pct status "$CTID" >/dev/null 2>&1; then
-    pct reboot "$CTID" >/dev/null 2>&1 || true
-  fi
-  return 0
+# In-container GPU sanity check runs INSIDE the LXC (via pct exec) after
+# creation — that's where a device-mount failure actually shows up, not at
+# container creation time.
+# (The engine's fix_gpu_gids() runs inside create_lxc_container() for us.)
+
+# ==============================================================================
+# UPDATE SUPPORT
+# ==============================================================================
+# Re-running the ct script on a host where the LocalAI LXC already exists
+# routes here instead of creating a duplicate. Matches the community-scripts
+# update_script() convention (called by build_container() / post-install
+# helper "Apply updates").
+localai_installed_in_ct() {
+  pct exec "$CTID" -- bash -c 'systemctl is-active --quiet localai 2>/dev/null || docker ps --format "{{.Names}}" 2>/dev/null | grep -qx localai' >/dev/null 2>&1
 }
 
+update_container() {
+  msg_info "Updating LocalAI inside CT ${CTID}"
+  # DEPLOY_MODE is persisted by the installer into /opt/localai/deploy-mode
+  local MODE
+  MODE=$(pct exec "$CTID" -- bash -c 'cat /opt/localai/deploy-mode 2>/dev/null || echo docker') || MODE="docker"
+  msg_info "Detected deployment mode: ${MODE}"
+
+  if [[ "$MODE" == "docker" ]]; then
+    msg_info "Pulling latest LocalAI image"
+    pct exec "$CTID" -- docker pull localai/localai:latest-aio-gpu-nvidia-cuda-13 || {
+      msg_error "Image pull failed — check connectivity / disk space"
+      exit 250
+    }
+    msg_ok "New image pulled"
+    msg_info "Recreating container"
+    pct exec "$CTID" -- systemctl restart localai
+    msg_ok "Container recreated from the new image"
+  else
+    msg_info "Re-downloading LocalAI binary"
+    pct exec "$CTID" -- bash -c 'DEPLOY_MODE=binary LOCALAI_VERSION=latest bash -s' <<'UPDATE_BINARY'
+set -e
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64)  LA_OS="Linux";  LA_ARCH="x86_64"  ;;
+  aarch64) LA_OS="Linux";  LA_ARCH="arm64"   ;;
+  *) echo "unsupported arch $ARCH"; exit 1 ;;
+esac
+TAG=$(curl -fsSL https://api.github.com/repos/mudler/LocalAI/releases/latest | jq -r '.tag_name')
+[[ -z "$TAG" || "$TAG" == "null" ]] && { echo "could not resolve latest"; exit 1; }
+DL_URL="https://github.com/mudler/LocalAI/releases/download/${TAG}/local-ai-${LA_OS}-${LA_ARCH}"
+curl -fsSL "$DL_URL" -o /usr/local/bin/local-ai.new && chmod +x /usr/local/bin/local-ai.new
+mv /usr/local/bin/local-ai.new /usr/local/bin/local-ai
+systemctl restart localai
+echo "updated to ${TAG}"
+UPDATE_BINARY
+    msg_ok "Binary updated and service restarted"
+  fi
+
+  sleep 8
+  if pct exec "$CTID" -- systemctl is-active --quiet localai; then
+    msg_ok "LocalAI is running after update"
+  else
+    msg_error "LocalAI not running after update — check journalctl -u localai in CT ${CTID}"
+  fi
+}
+
+function update_script() {
+  header_info
+  check_container_storage
+  check_container_resources
+  if ! localai_installed_in_ct; then
+    msg_error "No LocalAI installation found in CT ${CTID}!"
+    exit
+  fi
+  update_container
+  msg_ok "Updated successfully!"
+  exit
+}
 
 start
 pre_install_gpu_check
-# GPU mounts happen inside build_container() via our wrapper below.
-pre_create_gpu_mounts
 build_container
 description
 
+# Ship the in-container updater now that the container exists (needs
+# /opt/localai from the installer) — the installer persisted deploy-mode.
+if pct exec "$CTID" -- test -f /opt/localai/deploy-mode >/dev/null 2>&1; then
+  pct push "$CTID" "$(cd "$(dirname "${BASH_SOURCE[0]}")/../install" && pwd)/localai-update.sh" /opt/localai/update.sh >/dev/null 2>&1 && \
+    pct exec "$CTID" -- chmod +x /opt/localai/update.sh >/dev/null 2>&1 && \
+    msg_ok "In-container updater installed: /opt/localai/update.sh"
+fi
+
 msg_ok "Completed successfully!\n"
-echo -e "${CREATING}${GN}${APP} LXC created — LocalAI is installing inside...${CL}"
+echo -e "${CREATING}${GN}${APP} LXC created — LocalAI is installed and running${CL}"
 if [[ "$HOST_GPU" == "none" ]]; then
   echo -e "${INFO}${YW}Mode:${CL} CPU-only (unprivileged container)"
 else
@@ -183,3 +220,4 @@ else
 fi
 echo -e "${INFO}${YW}LocalAI API:${CL} ${GATEWAY}${BGN}http://${IP}:8080/v1${CL}"
 echo -e "${INFO}${YW}Models directory on the container:${CL} ${BGN}/opt/localai/models${CL}"
+echo -e "${INFO}${YW}Update later:${CL} re-run this script (update mode), or inside the container: ${BGN}bash /opt/localai/update.sh${CL}"
