@@ -247,6 +247,14 @@ BANNER
 chmod +x /etc/profile.d/localai-banner.sh
 msg_ok "Welcome banner installed (/etc/profile.d/localai-banner.sh)"
 
+# Also register as an update-motd fragment so SSH logins show it too
+# (profile.d only covers interactive shells; update-motd covers both).
+if [[ -d /etc/update-motd.d ]]; then
+  cp /etc/profile.d/localai-banner.sh /etc/update-motd.d/99-localai
+  chmod +x /etc/update-motd.d/99-localai
+  msg_ok "Banner registered in /etc/update-motd.d/ (SSH logins)"
+fi
+
 # ----------------------------------------------------------------------------
 # Verification
 # ----------------------------------------------------------------------------
