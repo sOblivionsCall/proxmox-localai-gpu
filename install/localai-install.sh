@@ -2,11 +2,15 @@
 # ============================================================================
 # LocalAI in-container installer — runs INSIDE the LXC after creation.
 #
-# Supports three hardware profiles, auto-detected:
-#   nvidia — CUDA userspace + nvidia-container-toolkit (GPU inference)
-#   amd    — ROCm userspace (GPU inference)
-#   intel  — Level Zero userspace (GPU inference)
-#   none   — CPU-only (no GPU, or GPU passthrough not configured)
+# Two deployment paths, chosen automatically:
+#   Docker path (default, RECOMMENDED for GPU nodes):
+#     - Installs Docker + nvidia-container-toolkit (NVIDIA) / ROCm device
+#       access (AMD) / Intel GPU runtime
+#     - Runs the official LocalAI container image, which ships ALL backends
+#       (diffusers, stablediffusion-cpp, TTS, STT, python backends)
+#   Binary path (fallback, or DEPLOY_MODE=binary):
+#     - Single GitHub release binary. LIMITED backends: no python backends,
+#       no stablediffusion-cpp on Linux. Chat/embeddings only.
 #
 # Modeled on community-scripts/ProxmoxVE install/*.sh convention.
 # ============================================================================
@@ -35,35 +39,50 @@ LOCALAI_DIR=/opt/localai
 LOCALAI_BIN=/usr/local/bin/local-ai
 MODELS_DIR=$LOCALAI_DIR/models
 LOCALAI_VERSION="${LOCALAI_VERSION:-latest}"
+DEPLOY_MODE="${DEPLOY_MODE:-auto}"   # auto | docker | binary
 ARCH=$(uname -m)
 
 msg_info "Installing base dependencies"
 if command -v apt >/dev/null 2>&1; then
   apt-get update -qq
-  apt-get install -y -qq curl ca-certificates wget jq pciutils >/dev/null
+  apt-get install -y -qq curl ca-certificates wget jq pciutils gnupg >/dev/null
 fi
 msg_ok "Base dependencies"
 
 # ----------------------------------------------------------------------------
-# GPU detection + userspace runtime install
+# GPU detection
 # ----------------------------------------------------------------------------
 GPU_VENDOR="none"
 if lspci 2>/dev/null | grep -qi 'nvidia'; then
   GPU_VENDOR="nvidia"
-elif lspci 2>/dev/null | grep -Eiq 'vga.*amd|amd/ati|radeon'; then
-  if [[ -e /dev/kfd ]]; then
-    GPU_VENDOR="amd"
-  fi
-elif lspci 2>/dev/null | grep -Eiq 'intel.*(iris|arc|uhd)'; then
+elif lspci 2>/dev/null | grep -Eiq 'vga.*amd|amd/ati|radeon' && [[ -e /dev/kfd ]]; then
+  GPU_VENDOR="amd"
+elif lspci 2>/dev/null | grep -Eiq 'intel.*(iris|arc|uhd)' && [[ -e /dev/dri ]]; then
   GPU_VENDOR="intel"
 fi
-
 msg_info "GPU vendor detected: ${GPU_VENDOR}"
 
-install_nvidia_userspace() {
-  # Userspace only. Kernel driver lives on the Proxmox host.
-  msg_info "Installing NVIDIA userspace + Container Toolkit"
-  apt-get install -y -qq gnupg >/dev/null
+# ----------------------------------------------------------------------------
+# Deployment mode resolution
+# ----------------------------------------------------------------------------
+if [[ "$DEPLOY_MODE" == "auto" ]]; then
+  # Docker for GPU nodes (full backend set incl. diffusers image-gen);
+  # binary is fine for CPU-only chat/embeddings nodes.
+  if [[ "$GPU_VENDOR" != "none" ]]; then
+    DEPLOY_MODE="docker"
+  else
+    DEPLOY_MODE="binary"
+  fi
+fi
+msg_info "Deployment mode: ${DEPLOY_MODE} (GPU vendor: ${GPU_VENDOR})"
+
+# ----------------------------------------------------------------------------
+# Docker + NVIDIA Container Toolkit (docker path)
+# ----------------------------------------------------------------------------
+install_docker_nvidia() {
+  msg_info "Installing Docker + NVIDIA Container Toolkit"
+  curl -fsSL https://get.docker.com | sh >/dev/null 2>&1 || { msg_error "Docker install failed"; exit 250; }
+
   mkdir -p /usr/share/keyrings
   curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
     | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
@@ -71,88 +90,123 @@ install_nvidia_userspace() {
     | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
     > /etc/apt/sources.list.d/nvidia-container-toolkit.list
   apt-get update -qq
-  apt-get install -y -qq libnvidia-container-tools nvidia-container-toolkit >/dev/null
-  # CUDA runtime libs for the native LocalAI binary (Docker users get them
-  # injected via the toolkit instead).
-  apt-get install -y -qq libcublas-13-1 libcudart-13-1 2>/dev/null \
-    || msg_warn "CUDA runtime libs not found in repo — install manually if GPU inference fails"
-  msg_ok "NVIDIA userspace installed"
+  apt-get install -y -qq nvidia-container-toolkit >/dev/null
+  nvidia-ctk runtime configure --runtime=docker >/dev/null
+  systemctl restart docker
+  msg_ok "Docker + NVIDIA Container Toolkit installed"
+
+  # Verify GPU visibility from inside a container
+  if docker run --rm --gpus all nvidia/cuda:13.1.1-base-ubuntu24.04 nvidia-smi >/dev/null 2>&1; then
+    msg_ok "GPU visible inside Docker containers"
+  else
+    msg_warn "GPU not visible inside Docker containers — check host device mounts"
+  fi
 }
 
-install_amd_userspace() {
-  msg_info "Installing AMD ROCm userspace (this is large, patience)"
-  mkdir -p /usr/share/keyrings
-  curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
-    | gpg --dearmor -o /usr/share/keyrings/rocm-keyring.gpg
-  echo "deb [signed-by=/usr/share/keyrings/rocm-keyring.gpg] https://repo.radeon.com/rocm/apt/6.2 jammy main" \
-    > /etc/apt/sources.list.d/rocm.list
-  apt-get update -qq
-  apt-get install -y -qq rocm-hip-libraries >/dev/null || msg_warn "ROCm install incomplete"
-  msg_ok "AMD ROCm userspace installed"
+install_docker_amd() {
+  msg_info "Installing Docker (AMD GPU access via /dev/kfd + /dev/dri bind mounts)"
+  curl -fsSL https://get.docker.com | sh || { msg_error "Docker install failed"; exit 250; }
+  msg_ok "Docker installed (compose adds the device mounts)"
 }
 
-install_intel_userspace() {
-  msg_info "Installing Intel Level Zero userspace"
-  mkdir -p /usr/share/keyrings
-  curl -fsSL https://repositories.intel.com/gpu/intel-graphics.key \
-    | gpg --dearmor -o /usr/share/keyrings/intel-graphics.gpg
-  echo "deb [signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu jammy client" \
-    > /etc/apt/sources.list.d/intel-gpu.sources
-  apt-get update -qq
-  apt-get install -y -qq intel-level-zero-gpu level-zero level-zero-dev >/dev/null 2>&1 || msg_warn "Level Zero install incomplete"
-  msg_ok "Intel Level Zero installed"
+install_docker_intel() {
+  msg_info "Installing Docker (Intel GPU access via /dev/dri bind mounts)"
+  curl -fsSL https://get.docker.com | sh || { msg_error "Docker install failed"; exit 250; }
+  msg_ok "Docker installed (compose adds the device mounts)"
 }
 
-case "$GPU_VENDOR" in
-  nvidia) install_nvidia_userspace ;;
-  amd)    install_amd_userspace ;;
-  intel)  install_intel_userspace ;;
-  *)      msg_ok "No GPU detected — installing CPU-only LocalAI (works fine, slower for large models)" ;;
-esac
+# ----------------------------------------------------------------------------
+# Binary path (CPU-only chat/embeddings; LIMITED backends — see README)
+# ----------------------------------------------------------------------------
+install_binary() {
+  case "$ARCH" in
+    x86_64)  LA_OS="Linux";  LA_ARCH="x86_64"  ;;
+    aarch64) LA_OS="Linux";  LA_ARCH="arm64"   ;;
+    *) msg_error "Unsupported arch: $ARCH"; exit 250 ;;
+  esac
+
+  if [[ "$LOCALAI_VERSION" == "latest" ]]; then
+    TAG=$(curl -fsSL https://api.github.com/repos/mudler/LocalAI/releases/latest | jq -r '.tag_name')
+  else
+    TAG="v${LOCALAI_VERSION#v}"
+  fi
+  [[ -z "$TAG" || "$TAG" == "null" ]] && { msg_error "Could not resolve latest LocalAI release"; exit 250; }
+
+  # v4 asset naming: local-ai-v4.9.0-Linux-x86_64 (single binary, no archive)
+  DL_URL="https://github.com/mudler/LocalAI/releases/download/${TAG}/local-ai-${LA_OS}-${LA_ARCH}"
+  msg_info "Downloading LocalAI ${TAG} single binary"
+  mkdir -p "$LOCALAI_DIR"
+  curl -fsSL "$DL_URL" -o "$LOCALAI_BIN" || { msg_error "Download failed: $DL_URL"; exit 250; }
+  chmod +x "$LOCALAI_BIN"
+  msg_ok "LocalAI binary installed at $LOCALAI_BIN (limited backends: no python/diffusers/stablediffusion-cpp)"
+}
 
 # ----------------------------------------------------------------------------
-# LocalAI binary
+# Docker path: run the official LocalAI AIO image as a systemd service
 # ----------------------------------------------------------------------------
-msg_info "Downloading LocalAI (${LOCALAI_VERSION}, ${ARCH})"
-mkdir -p "$LOCALAI_DIR" "$MODELS_DIR"
-case "$ARCH" in
-  x86_64) LA_ARCH="x86_64" ;;
-  aarch64|arm64) LA_ARCH="arm64" ;;
-  *) msg_error "Unsupported arch: $ARCH"; exit 250 ;;
-esac
+install_docker_localai() {
+  case "$GPU_VENDOR" in
+    nvidia)
+      IMAGE="localai/localai:latest-aio-gpu-nvidia-cuda-13"
+      GPU_FLAGS="--gpus all"
+      ;;
+    amd)
+      IMAGE="localai/localai:latest-aio-gpu-amd-rocm"
+      GPU_FLAGS="--device=/dev/kfd --device=/dev/dri --group-add video --group-add render"
+      ;;
+    intel)
+      IMAGE="localai/localai:latest-gpu-intel"
+      GPU_FLAGS="--device=/dev/dri"
+      ;;
+    *)
+      IMAGE="localai/localai:latest"
+      GPU_FLAGS=""
+      ;;
+  esac
 
-if [[ "$LOCALAI_VERSION" == "latest" ]]; then
-  DL_URL=$(curl -fsSL https://api.github.com/repos/mudler/LocalAI/releases/latest \
-    | jq -r ".assets[] | select(.name | contains(\"linux-${LA_ARCH}\")) | select(.name | endswith(\".tar.gz\")) | .browser_download_url" | head -1)
-else
-  DL_URL=$(curl -fsSL "https://api.github.com/repos/mudler/LocalAI/releases/tags/v${LOCALAI_VERSION#v}" \
-    | jq -r ".assets[] | select(.name | contains(\"linux-${LA_ARCH}\")) | select(.name | endswith(\".tar.gz\")) | .browser_download_url" | head -1)
-fi
-if [[ -z "$DL_URL" || "$DL_URL" == "null" ]]; then
-  msg_error "Could not resolve a LocalAI release asset for linux-${LA_ARCH}"
-  exit 250
-fi
-curl -fsSL "$DL_URL" -o /tmp/localai.tar.gz
-tar -xzf /tmp/localai.tar.gz -C "$LOCALAI_DIR"
-if [[ -f "$LOCALAI_DIR/local-ai" ]]; then
-  ln -sf "$LOCALAI_DIR/local-ai" "$LOCALAI_BIN"
-elif [[ -f "$LOCALAI_DIR/usr/local/bin/local-ai" ]]; then
-  ln -sf "$LOCALAI_DIR/usr/local/bin/local-ai" "$LOCALAI_BIN"
-else
-  FOUND=$(find "$LOCALAI_DIR" -maxdepth 3 -name 'local-ai' -type f | head -1)
-  [[ -n "$FOUND" ]] && ln -sf "$FOUND" "$LOCALAI_BIN" || { msg_error "local-ai binary not found after unpack"; exit 250; }
-fi
-chmod +x "$LOCALAI_BIN"
-rm -f /tmp/localai.tar.gz
-msg_ok "LocalAI installed at $LOCALAI_BIN"
+  msg_info "Deploying LocalAI container (${IMAGE})"
+  mkdir -p "$MODELS_DIR"
+  # Pull in the background — it's multi-GB, and the service definition below
+  # doesn't depend on the pull finishing to be valid.
+  docker pull "$IMAGE" >/dev/null 2>&1 || msg_warn "Initial pull failed — service will retry on start"
+
+  cat > /etc/systemd/system/localai.service <<EOF
+[Unit]
+Description=LocalAI — OpenAI-compatible API (chat/images/audio)
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+ExecStartPre=-/usr/bin/docker rm -f localai
+ExecStart=/usr/bin/docker run --name localai --restart no \\
+  -p 8080:8080 \\
+  ${GPU_FLAGS} \\
+  -v ${MODELS_DIR}:/models \\
+  -e DEBUG=true \\
+  $IMAGE
+ExecStop=/usr/bin/docker stop localai
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable -q --now localai
+  msg_ok "localai.service enabled (docker: ${IMAGE})"
+}
 
 # ----------------------------------------------------------------------------
-# Model configs — chat LLM (small), image gen, embeddings
+# Binary path: model configs + native systemd service
 # ----------------------------------------------------------------------------
-msg_info "Writing model configs to $MODELS_DIR"
+install_binary_localai() {
+  msg_info "Writing model configs to $MODELS_DIR"
+  mkdir -p "$MODELS_DIR"
 
-# Small chat LLM (works on CPU or any GPU) — Qwen2.5 3B Instruct q4
-cat > "$MODELS_DIR/qwen2.5-3b-chat.yaml" <<'EOF'
+  # Small chat LLM (works on CPU or any GPU) — Qwen2.5 3B Instruct q4
+  cat > "$MODELS_DIR/qwen2.5-3b-chat.yaml" <<'EOF'
 name: qwen2.5-3b-chat
 backend: llama-cpp
 parameters:
@@ -162,18 +216,8 @@ gpu_layers: 99
 f16: true
 EOF
 
-# Image generation — SD1.5-class via stablediffusion-ggml (smallest footprint)
-cat > "$MODELS_DIR/stablediffusion.yaml" <<'EOF'
-name: stablediffusion
-backend: stablediffusion-ggml
-parameters:
-  model: huggingface://second-state/stable-diffusion-v1-5-GGUF/stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf
-step: 25
-cfg_scale: 4.5
-EOF
-
-# Embeddings — tiny
-cat > "$MODELS_DIR/embeddings.yaml" <<'EOF'
+  # Embeddings — tiny
+  cat > "$MODELS_DIR/embeddings.yaml" <<'EOF'
 embeddings: true
 name: text-embedding-ada-002
 backend: llama-cpp
@@ -181,15 +225,13 @@ parameters:
   model: huggingface://bartowski/granite-embedding-107m-multilingual-GGUF/granite-embedding-107m-multilingual-f16.gguf
 EOF
 
-msg_ok "Model configs written (models download on first use)"
+  if [[ "$GPU_VENDOR" == "none" ]]; then
+    msg_warn "CPU-only binary mode: image generation is NOT available (diffusers backend needs Docker). Chat + embeddings only."
+  fi
 
-# ----------------------------------------------------------------------------
-# systemd service
-# ----------------------------------------------------------------------------
-msg_info "Creating systemd service"
-cat > /etc/systemd/system/localai.service <<EOF
+  cat > /etc/systemd/system/localai.service <<EOF
 [Unit]
-Description=LocalAI — OpenAI-compatible API (chat/images/audio)
+Description=LocalAI — OpenAI-compatible API (chat/embeddings)
 After=network-online.target
 Wants=network-online.target
 
@@ -197,9 +239,8 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=$LOCALAI_DIR
-ExecStart=$LOCALAI_BIN run --models-path $MODELS_DIR --host 0.0.0.0 --port 8080 --context-size 2048
+ExecStart=$LOCALAI_BIN run --models-path $MODELS_DIR --host 0.0.0.0 --port 8080
 Environment=MODELS_PATH=$MODELS_DIR
-Environment=GALLERIES=[{"name":"model-gallery","url":"github:mudler/LocalAI/gallery/index.yaml@master"}]
 Restart=always
 RestartSec=5
 
@@ -207,49 +248,62 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-# GPU-specific env additions
-if [[ "$GPU_VENDOR" == "nvidia" ]]; then
-  sed -i "/\[Service\]/a Environment=LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64" \
-    /etc/systemd/system/localai.service
-elif [[ "$GPU_VENDOR" == "amd" ]]; then
-  sed -i "/\[Service\]/a Environment=LD_LIBRARY_PATH=/opt/rocm/lib" \
-    /etc/systemd/system/localai.service
-fi
-# CPU-only containers need no GPU env.
+  systemctl daemon-reload
+  systemctl enable -q --now localai
+  msg_ok "localai.service enabled (binary mode)"
+}
 
-systemctl daemon-reload
-systemctl enable -q --now localai
-msg_ok "localai.service enabled"
+# ----------------------------------------------------------------------------
+# Execute the chosen path
+# ----------------------------------------------------------------------------
+msg_info "Deployment mode: ${DEPLOY_MODE}"
+case "$DEPLOY_MODE" in
+  docker)
+    case "$GPU_VENDOR" in
+      nvidia) install_docker_nvidia ;;
+      amd)    install_docker_amd ;;
+      intel)  install_docker_intel ;;
+      *)      curl -fsSL https://get.docker.com | sh >/dev/null 2>&1 || true ;;
+    esac
+    install_docker_localai
+    ;;
+  binary)
+    install_binary
+    install_binary_localai
+    ;;
+  *)
+    msg_error "Unknown DEPLOY_MODE: $DEPLOY_MODE (use auto|docker|binary)"
+    exit 250
+    ;;
+esac
 
 # ----------------------------------------------------------------------------
 # Verification
 # ----------------------------------------------------------------------------
-sleep 5
+sleep 8
 if systemctl is-active --quiet localai; then
   msg_ok "LocalAI is running"
 else
-  msg_error "LocalAI failed to start — check 'journalctl -u localai'"
+  msg_error "LocalAI failed to start — check 'journalctl -u localai' (docker path: 'docker logs localai')"
 fi
 
-case "$GPU_VENDOR" in
-  nvidia)
-    if nvidia-smi >/dev/null 2>&1; then
-      msg_ok "nvidia-smi works inside the container — GPU visible"
-    else
-      msg_warn "nvidia-smi not functional — check host driver + device mounts (falling back to CPU)"
-    fi
-    ;;
-  amd)
-    if [[ -e /dev/kfd ]]; then
-      msg_ok "/dev/kfd visible — ROCm should initialize"
-    else
-      msg_warn "/dev/kfd missing — check host device mounts (falling back to CPU)"
-    fi
-    ;;
-  *)
-    msg_ok "CPU-only mode — no GPU verification needed"
-    ;;
-esac
+if [[ "$DEPLOY_MODE" == "docker" ]]; then
+  case "$GPU_VENDOR" in
+    nvidia)
+      if docker exec localai nvidia-smi >/dev/null 2>&1; then
+        msg_ok "GPU visible inside the LocalAI container — CUDA inference available"
+      else
+        msg_warn "GPU not visible inside the container — check host device mounts (LocalAI falls back to CPU)"
+      fi
+      ;;
+    amd)
+      [[ -e /dev/kfd ]] && msg_ok "/dev/kfd visible — ROCm should initialize" \
+        || msg_warn "/dev/kfd missing — check host device mounts"
+      ;;
+  esac
+else
+  msg_ok "Binary mode — CPU-only verification skipped"
+fi
 
 # ----------------------------------------------------------------------------
 # community-scripts housekeeping (when driven via ct/localai.sh)
@@ -261,4 +315,4 @@ if declare -F motd_ssh >/dev/null 2>&1; then
 fi
 
 IP=$(hostname -I | awk '{print $1}')
-msg_ok "LocalAI installation complete — API: http://${IP}:8080/v1 (${GPU_VENDOR} mode)"
+msg_ok "LocalAI installation complete — API: http://${IP}:8080/v1 (${DEPLOY_MODE}/${GPU_VENDOR})"
