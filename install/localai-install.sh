@@ -78,6 +78,7 @@ esac
 # ----------------------------------------------------------------------------
 # LocalAI binary — v4 single-binary release asset naming
 # ----------------------------------------------------------------------------
+ARCH=$(uname -m)
 case "$ARCH" in
   x86_64)  LA_OS="Linux";  LA_ARCH="x86_64"  ;;
   aarch64) LA_OS="Linux";  LA_ARCH="arm64"   ;;

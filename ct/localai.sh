@@ -6,14 +6,16 @@
 # host-side launcher. It creates the LXC, then delegates to
 # install/localai-install.sh inside the container.
 #
-# Philosophy: the installer provides the working platform — OS, device
-# passthrough (when a GPU exists), the LocalAI binary, and model configs.
-# Configuring LocalAI itself is up to the user (drop YAMLs into
-# /opt/localai/models).
+# GPU handling (matches the proven community-scripts Ollama LXC pattern):
+#   1. The engine (var_gpu=yes) adds dev0..devN device entries for the
+#      NVIDIA nodes at container creation.
+#   2. We bind-mount the HOST's NVIDIA userspace driver libraries into the
+#      container (libcuda, libnvidia-ml, libcudart, ptxjitcompiler,
+#      allocator) plus nvidia-smi — the container needs zero CUDA packages
+#      and never gets a kernel driver.
 #
-# GPU handling: the community-scripts ENGINE performs GPU passthrough itself
-# (detect_gpu_devices + configure_gpu_passthrough + fix_gpu_gids) when
-# var_gpu=yes. We set var_gpu based on host detection and stay out of the way.
+# Philosophy: the installer provides the working platform. Configuring
+# LocalAI is up to the user (drop YAMLs into /opt/localai/models).
 #
 # Run from the Proxmox HOST shell:
 #   bash -c "$(wget -qLO - https://raw.githubusercontent.com/sOblivionsCall/proxmox-localai-gpu/main/ct/localai.sh)"
@@ -45,29 +47,24 @@ detect_host_gpu() {
 }
 
 HOST_GPU="${HOST_GPU:-$(detect_host_gpu)}"
-# Explicit override: GPU=no forces CPU-only, GPU=yes requires a GPU.
 if [[ "${GPU:-}" == "no" ]]; then
   HOST_GPU="none"
 fi
 
 if [[ "$HOST_GPU" == "none" ]]; then
-  # CPU-only: unprivileged is both possible and preferred (more secure).
   var_gpu="no"
   var_unprivileged="${var_unprivileged:-1}"
 else
-  # Engine picks up var_gpu=yes and runs its own configure_gpu_passthrough()
-  # + fix_gpu_gids() inside create_lxc_container().
+  # Engine adds dev0..devN device entries inside create_lxc_container().
   var_gpu="yes"
   var_unprivileged="${var_unprivileged:-0}"
 fi
 
 # ----------------------------------------------------------------------------
-# Community-scripts build.func integration (host-side scaffolding).
-#
-# The engine derives the install-script name from APP: NSAPP=lowercase(APP),
-# var_install="${NSAPP}-install" → "localai-install". It fetches that from
-# COMMUNITY_SCRIPTS_URL, so the base MUST point at THIS repo — otherwise it
-# 404s against ProxmoxVED (which is exactly the failure seen on first run).
+# Community-scripts build.func integration.
+# The engine derives the install-script name from APP (NSAPP=localai,
+# var_install=localai-install) and fetches it from COMMUNITY_SCRIPTS_URL,
+# which MUST point at this repo.
 # ----------------------------------------------------------------------------
 REPO_BASE="${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/sOblivionsCall/proxmox-localai-gpu/main}"
 export COMMUNITY_SCRIPTS_URL="$REPO_BASE"
@@ -81,7 +78,6 @@ elif curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com
   USE_CS_CORE=1
 else
   USE_CS_CORE=0
-  # Fallback: self-contained minimal scaffolding (no community-scripts dep).
   # shellcheck source=/dev/null
   source "$(dirname "${BASH_SOURCE[0]}")/../core/minimal-build.func"
 fi
@@ -91,7 +87,6 @@ variables
 color
 catch_errors
 
-# GPU warning: make sure the host actually has a driver BEFORE building.
 pre_install_gpu_check() {
   if [[ "$HOST_GPU" == "none" ]]; then
     if [[ "${GPU:-}" == "yes" ]]; then
@@ -99,21 +94,17 @@ pre_install_gpu_check() {
       exit 201
     fi
     msg_warn "No discrete GPU detected — building CPU-only LocalAI container."
-    msg_warn "Inference will be slow for large models. Set GPU passthrough up and re-run for GPU acceleration."
     return
   fi
   if [[ "$HOST_GPU" == "nvidia" ]] && ! command -v nvidia-smi >/dev/null 2>&1; then
     msg_warn "NVIDIA GPU found but 'nvidia-smi' is not available on the HOST."
-    msg_warn "Install the NVIDIA driver on the Proxmox HOST first — the container only gets device nodes + userspace."
-    msg_warn "Without a host driver, CUDA will not work and LocalAI falls back to CPU."
+    msg_warn "Install the NVIDIA driver on the Proxmox HOST first — the container gets the host's userspace libs bind-mounted in."
     if [[ "$ADVANCED" == "yes" ]]; then
       read -r -p "Continue anyway (CPU-only LocalAI)? [y/N]: " reply
       [[ "$reply" =~ ^[Yy]$ ]] || exit 201
     fi
   fi
-  # Ensure UVM devices exist on the host before container creation — the
-  # classic silent failure where /dev/nvidia-uvm doesn't exist until the
-  # first CUDA client touches it.
+  # Ensure UVM devices exist on the host before container creation.
   if [[ "$HOST_GPU" == "nvidia" ]] && command -v nvidia-modprobe >/dev/null 2>&1; then
     nvidia-modprobe -u -c=0 >/dev/null 2>&1 || true
   fi
@@ -123,17 +114,15 @@ pre_install_gpu_check() {
 }
 
 # ==============================================================================
-# UPDATE SUPPORT
+# UPDATE SUPPORT — re-running the ct script on a host where the LocalAI LXC
+# already exists routes here instead of creating a duplicate.
 # ==============================================================================
-# Re-running the ct script on a host where the LocalAI LXC already exists
-# routes here instead of creating a duplicate. Matches the community-scripts
-# update_script() convention.
 localai_installed_in_ct() {
   pct exec "$CTID" -- bash -c 'systemctl is-active --quiet localai 2>/dev/null' >/dev/null 2>&1
 }
 
 update_container() {
-  msg_info "Updating LocalAI inside CT ${CTID} (binary mode)"
+  msg_info "Updating LocalAI inside CT ${CTID}"
   pct exec "$CTID" -- bash /opt/localai/update.sh
   sleep 8
   if pct exec "$CTID" -- systemctl is-active --quiet localai; then
@@ -160,6 +149,46 @@ start
 pre_install_gpu_check
 build_container
 description
+
+# ----------------------------------------------------------------------------
+# Post-create: bind-mount the HOST's NVIDIA userspace driver libs into the
+# container (the community-scripts Ollama LXC pattern). The container gets
+# zero CUDA packages; it uses the host's driver userspace verbatim, which
+# also guarantees version match with the host kernel module.
+# ----------------------------------------------------------------------------
+mount_nvidia_userspace() {
+  [[ "$HOST_GPU" != "nvidia" ]] && return 0
+  msg_info "Bind-mounting host NVIDIA userspace libs into CT ${CTID}"
+  local CTConf="/etc/pve/lxc/${CTID}.conf"
+  local LIBDIR="/usr/lib/x86_64-linux-gnu"
+  local DRIVER_VER
+  DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | tr -d ' ')
+
+  # Devices were added by the engine as dev0..devN. Libraries are ours:
+  cat <<EOF >>"$CTConf"
+lxc.mount.entry: /usr/bin/nvidia-smi usr/bin/nvidia-smi none bind,optional,create=file
+lxc.mount.entry: ${LIBDIR}/libcuda.so ${LIBDIR#/}/libcuda.so none bind,optional,create=file
+lxc.mount.entry: ${LIBDIR}/libcuda.so.1 ${LIBDIR#/}/libcuda.so.1 none bind,optional,create=file
+lxc.mount.entry: ${LIBDIR}/libcuda.so.${DRIVER_VER} ${LIBDIR#/}/libcuda.so.${DRIVER_VER} none bind,optional,create=file
+lxc.mount.entry: ${LIBDIR}/libcudart.so.12 ${LIBDIR#/}/libcudart.so.12 none bind,optional,create=file
+lxc.mount.entry: ${LIBDIR}/libnvidia-allocator.so.1 ${LIBDIR#/}/libnvidia-allocator.so.1 none bind,optional,create=file
+lxc.mount.entry: ${LIBDIR}/libnvidia-ml.so.1 ${LIBDIR#/}/libnvidia-ml.so.1 none bind,optional,create=file
+lxc.mount.entry: ${LIBDIR}/libnvidia-ptxjitcompiler.so ${LIBDIR#/}/libnvidia-ptxjitcompiler.so none bind,optional,create=file
+lxc.mount.entry: ${LIBDIR}/libnvidia-ptxjitcompiler.so.1 ${LIBDIR#/}/libnvidia-ptxjitcompiler.so.1 none bind,optional,create=file
+EOF
+  msg_ok "Host NVIDIA userspace libs bind-mounted (driver ${DRIVER_VER})"
+
+  # Restart so the new mount entries take effect.
+  msg_info "Restarting CT ${CTID} to apply mounts"
+  pct reboot "$CTID" >/dev/null 2>&1 || { pct stop "$CTID" >/dev/null 2>&1; pct start "$CTID" >/dev/null 2>&1; }
+  sleep 5
+  if pct exec "$CTID" -- nvidia-smi >/dev/null 2>&1; then
+    msg_ok "nvidia-smi works inside the container — GPU visible"
+  else
+    msg_warn "nvidia-smi still not functional inside the container (LocalAI will run CPU-only)"
+  fi
+}
+mount_nvidia_userspace
 
 # Ship the in-container updater now that the container exists.
 if pct exec "$CTID" -- test -f /opt/localai/deploy-mode >/dev/null 2>&1; then
