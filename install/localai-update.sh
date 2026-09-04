@@ -24,7 +24,7 @@ esac
 TAG=$(curl -fsSL https://api.github.com/repos/mudler/LocalAI/releases/latest | jq -r '.tag_name')
 [[ -z "$TAG" || "$TAG" == "null" ]] && { msg_error "could not resolve latest release"; exit 1; }
 
-DL_URL="https://github.com/mudler/LocalAI/releases/download/${TAG}/local-ai-${LA_OS}-${LA_ARCH}"
+DL_URL="https://github.com/mudler/LocalAI/releases/download/${TAG}/local-ai-${TAG}-linux-${LA_ARCH}"
 msg_info "Downloading LocalAI ${TAG}"
 curl -fsSL "$DL_URL" -o /usr/local/bin/local-ai.new
 chmod +x /usr/local/bin/local-ai.new

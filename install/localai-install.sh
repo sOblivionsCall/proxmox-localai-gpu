@@ -92,7 +92,9 @@ else
 fi
 [[ -z "$TAG" || "$TAG" == "null" ]] && { msg_error "Could not resolve latest LocalAI release"; exit 250; }
 
-DL_URL="https://github.com/mudler/LocalAI/releases/download/${TAG}/local-ai-${LA_OS}-${LA_ARCH}"
+# v4 asset naming is fully versioned: local-ai-v4.9.0-linux-amd64
+# (the unversioned local-ai-Linux-x86_64 alias no longer exists and 404s).
+DL_URL="https://github.com/mudler/LocalAI/releases/download/${TAG}/local-ai-${TAG}-linux-${LA_ARCH}"
 msg_info "Downloading LocalAI ${TAG} binary"
 mkdir -p "$LOCALAI_DIR" "$MODELS_DIR" "$BACKENDS_DIR"
 curl -fsSL "$DL_URL" -o "$LOCALAI_BIN" || { msg_error "Download failed: $DL_URL"; exit 250; }
