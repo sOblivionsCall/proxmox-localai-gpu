@@ -21,7 +21,7 @@ Practical consequences:
 - **Chat, image gen, embeddings, TTS/STT all work in binary mode.** The starter configs include an image-gen model (`stablediffusion`, via the `diffusers` backend).
 - **First use pulls the backend** — the first request against a `backend: diffusers` model downloads a multi-GB OCI image before generating. Be patient, and give the container disk headroom.
 - **Backends persist** in `/opt/localai/backends` (installer sets `LOCALAI_BACKENDS_PATH` so they survive restarts and don't fill `/tmp`).
-- **Pre-install instead of lazily** if you prefer: `local-ai backends install diffusers` (or via the web UI's Backends page).
+- **Pre-install instead of lazily** if you prefer: `local-ai backends install diffusers` (or via the web UI's Backends page). **Gotcha:** run it with the env var set — `LOCALAI_BACKENDS_PATH=/opt/localai/backends local-ai backends install <name>` — otherwise LocalAI defaults to `/root/backends`, the install lands in the wrong place, and the model load fails with "backend not found". (The systemd service always carries the variable; only manual CLI runs need it exported.)
 - **Updates**: `bash /opt/localai/update.sh` re-downloads the LocalAI binary; backends persist across binary updates.
 
 ## Requirements

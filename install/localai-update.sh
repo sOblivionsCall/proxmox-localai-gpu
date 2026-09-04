@@ -14,6 +14,10 @@ msg_info() { echo -e "\e[36m[INFO]\e[0m  $*"; }
 msg_ok()   { echo -e "\e[32m[ OK ]\e[0m  $*"; }
 msg_error(){ echo -e "\e[31m[FAIL]\e[0m  $*"; }
 
+# Export the backend path so any `local-ai backends ...` CLI call in this
+# shell lands in /opt/localai/backends instead of the default /root/backends.
+export LOCALAI_BACKENDS_PATH=/opt/localai/backends
+
 ARCH=$(uname -m)
 case "$ARCH" in
   x86_64)  LA_ARCH="amd64"  ;;
