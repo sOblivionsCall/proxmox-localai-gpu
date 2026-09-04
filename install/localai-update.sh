@@ -16,8 +16,8 @@ msg_error(){ echo -e "\e[31m[FAIL]\e[0m  $*"; }
 
 ARCH=$(uname -m)
 case "$ARCH" in
-  x86_64)  LA_OS="Linux";  LA_ARCH="x86_64"  ;;
-  aarch64) LA_OS="Linux";  LA_ARCH="arm64"   ;;
+  x86_64)  LA_ARCH="amd64"  ;;
+  aarch64) LA_ARCH="arm64"  ;;
   *) msg_error "unsupported arch $ARCH"; exit 1 ;;
 esac
 

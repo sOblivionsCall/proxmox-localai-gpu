@@ -80,8 +80,8 @@ esac
 # ----------------------------------------------------------------------------
 ARCH=$(uname -m)
 case "$ARCH" in
-  x86_64)  LA_OS="Linux";  LA_ARCH="x86_64"  ;;
-  aarch64) LA_OS="Linux";  LA_ARCH="arm64"   ;;
+  x86_64)  LA_ARCH="amd64"  ;;
+  aarch64) LA_ARCH="arm64"  ;;
   *) msg_error "Unsupported arch: $ARCH"; exit 250 ;;
 esac
 
