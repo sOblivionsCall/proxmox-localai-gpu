@@ -9,14 +9,15 @@
 #     only check that the device nodes are visible and report honestly.
 #   - CPU: nothing extra needed.
 #
-# Known limitation of the binary (documented by upstream): no Python-based
-# backends (diffusers, transformers) and no stablediffusion-cpp — so image
-# generation via those backends is not available in binary mode. Chat
-# (llama-cpp), embeddings, and reranking work fully, with GPU offload when
-# the device is visible.
-#
-# If image generation is required, run LocalAI via Docker instead:
-#   docker run -p 8080:8080 --gpus all -v ./models:/models localai/localai:latest-aio-gpu-nvidia-cuda-13
+# BACKENDS: since LocalAI v3.2 all backends live OUTSIDE the binary as OCI
+# images. LocalAI pulls and runs them itself — daemonless, no Docker needed.
+# Backends auto-install on first use of a model that needs them, or can be
+# pre-installed:  local-ai backends install <name>
+# e.g. diffusers (image gen), piper (TTS), whisper (STT) all work in binary
+# mode. The only true limitation: the binary ships no CORE backends, so the
+# first model load pulls its backend over the network (needs connectivity,
+# LOCALAI_BACKENDS_PATH for a persistent cache, and enough disk — backends
+# can be GB-sized).
 #
 # Modeled on community-scripts/ProxmoxVE install/*.sh convention.
 # ============================================================================
@@ -44,6 +45,7 @@ fi
 LOCALAI_DIR=/opt/localai
 LOCALAI_BIN=/usr/local/bin/local-ai
 MODELS_DIR=$LOCALAI_DIR/models
+BACKENDS_DIR=$LOCALAI_DIR/backends
 LOCALAI_VERSION="${LOCALAI_VERSION:-latest}"
 
 msg_info "Installing base dependencies"
@@ -91,17 +93,22 @@ fi
 
 DL_URL="https://github.com/mudler/LocalAI/releases/download/${TAG}/local-ai-${LA_OS}-${LA_ARCH}"
 msg_info "Downloading LocalAI ${TAG} binary"
-mkdir -p "$LOCALAI_DIR"
+mkdir -p "$LOCALAI_DIR" "$MODELS_DIR" "$BACKENDS_DIR"
 curl -fsSL "$DL_URL" -o "$LOCALAI_BIN" || { msg_error "Download failed: $DL_URL"; exit 250; }
 chmod +x "$LOCALAI_BIN"
 msg_ok "LocalAI binary installed at $LOCALAI_BIN"
 
 # ----------------------------------------------------------------------------
-# Model configs — chat LLM, embeddings. gpu_layers: 99 = "offload what fits",
-# so the same configs serve CPU-only and GPU-visible containers.
+# Model configs — chat LLM, image gen (diffusers), embeddings.
+# gpu_layers: 99 = "offload what fits", so the same configs serve CPU-only
+# and GPU-visible containers.
+#
+# The diffusers config demonstrates the on-demand backend system: LocalAI
+# pulls the diffusers OCI backend automatically the first time a model
+# request uses backend: diffusers (no Docker involved — LocalAI fetches and
+# runs OCI backend images itself). Backends are GB-sized; disk matters.
 # ----------------------------------------------------------------------------
 msg_info "Writing model configs to $MODELS_DIR"
-mkdir -p "$MODELS_DIR"
 
 cat > "$MODELS_DIR/qwen2.5-3b-chat.yaml" <<'EOF'
 name: qwen2.5-3b-chat
@@ -113,6 +120,17 @@ gpu_layers: 99
 f16: true
 EOF
 
+cat > "$MODELS_DIR/stablediffusion.yaml" <<'EOF'
+name: stablediffusion
+backend: diffusers
+parameters:
+  model: Lykon/DreamShaper
+step: 25
+diffusers:
+  pipeline_type: StableDiffusionPipeline
+  scheduler_type: "k_dpmpp_2m"
+EOF
+
 cat > "$MODELS_DIR/embeddings.yaml" <<'EOF'
 embeddings: true
 name: text-embedding-ada-002
@@ -121,11 +139,7 @@ parameters:
   model: huggingface://bartowski/granite-embedding-107m-multilingual-GGUF/granite-embedding-107m-multilingual-f16.gguf
 EOF
 
-msg_ok "Model configs written (models download on first use)"
-
-if [[ "$GPU_STATUS" == "cpu" ]]; then
-  msg_warn "CPU-only: chat + embeddings will work. Image generation is NOT available in binary mode (needs the Docker image with diffusers)."
-fi
+msg_ok "Model configs written (models + backends download on first use)"
 
 # ----------------------------------------------------------------------------
 # systemd service
@@ -133,7 +147,7 @@ fi
 msg_info "Creating systemd service"
 cat > /etc/systemd/system/localai.service <<EOF
 [Unit]
-Description=LocalAI — OpenAI-compatible API (chat/embeddings)
+Description=LocalAI — OpenAI-compatible API (chat/images/embeddings)
 After=network-online.target
 Wants=network-online.target
 
@@ -143,12 +157,18 @@ User=root
 WorkingDirectory=$LOCALAI_DIR
 ExecStart=$LOCALAI_BIN run --models-path $MODELS_DIR --host 0.0.0.0 --port 8080
 Environment=MODELS_PATH=$MODELS_DIR
+# Persist backends (GB-sized OCI extractions) and scratch space outside /tmp
+Environment=LOCALAI_BACKENDS_PATH=$BACKENDS_DIR
+Environment=LOCALAI_UPLOAD_PATH=$LOCALAI_DIR/upload
+Environment=LOCALAI_GENERATED_CONTENT_PATH=$LOCALAI_DIR/generated
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+mkdir -p "$LOCALAI_DIR/upload" "$LOCALAI_DIR/generated"
 
 systemctl daemon-reload
 systemctl enable -q --now localai

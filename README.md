@@ -1,6 +1,6 @@
 # Proxmox LocalAI GPU Node
 
-One-command Proxmox VE LXC installer for [LocalAI](https://github.com/mudler/LocalAI) with **automatic GPU passthrough** (NVIDIA / AMD / Intel) **and full CPU-only support**. Serves OpenAI-compatible APIs for **chat LLMs, embeddings, and reranking** on your own hardware.
+One-command Proxmox VE LXC installer for [LocalAI](https://github.com/mudler/LocalAI) with **automatic GPU passthrough** (NVIDIA / AMD / Intel) **and full CPU-only support**. Serves OpenAI-compatible APIs for **chat LLMs, image generation, embeddings, TTS, and STT** on your own hardware.
 
 Unlike [yenksid/proxmox-local-ai](https://github.com/yenksid/proxmox-local-ai) (CPU-only, single hardcoded GGUF, no GPU support), this installer detects your hardware and wires the whole chain: host driver check → LXC device passthrough (via the community-scripts engine) → LocalAI binary with GPU offload — or a clean unprivileged CPU-only container.
 
@@ -12,19 +12,17 @@ What it does automatically: OS setup, GPU device passthrough, the LocalAI binary
 
 What it leaves to you: model selection and tuning — drop YAML files into `/opt/localai/models` and they hot-load. [LocalAI model configuration docs](https://localai.io/docs/advanced/model-configuration/).
 
-## Binary-mode limitation (important)
+## How backends work (no Docker required)
 
-LocalAI's release binary does **not** ship Python-based backends or `stablediffusion-cpp` (upstream docs: [Binaries](https://localai.io/reference/binaries/)). Concretely:
+Since LocalAI v3.2, **all backends ship outside the binary** as OCI images that LocalAI itself downloads, extracts, and runs — daemonless, no Docker involved. This includes `diffusers` (image generation), `whisper` (STT), `piper` (TTS), and 60+ others.
 
-| Capability | Binary mode (this installer) | Docker image |
-|---|---|---|
-| Chat LLMs (llama-cpp) | ✅ | ✅ |
-| Embeddings / reranking | ✅ | ✅ |
-| GPU offload | ✅ (when device visible) | ✅ |
-| **Image generation** (diffusers, SD) | ❌ | ✅ |
-| TTS / STT | ❌ | ✅ |
+Practical consequences:
 
-If you need image generation or TTS, run LocalAI via Docker instead — inside this container after install (`docker run -p 8080:8080 --gpus all -v /opt/localai/models:/models localai/localai:latest-aio-gpu-nvidia-cuda-13`) or elsewhere. The installer prints this reminder at install time.
+- **Chat, image gen, embeddings, TTS/STT all work in binary mode.** The starter configs include an image-gen model (`stablediffusion`, via the `diffusers` backend).
+- **First use pulls the backend** — the first request against a `backend: diffusers` model downloads a multi-GB OCI image before generating. Be patient, and give the container disk headroom.
+- **Backends persist** in `/opt/localai/backends` (installer sets `LOCALAI_BACKENDS_PATH` so they survive restarts and don't fill `/tmp`).
+- **Pre-install instead of lazily** if you prefer: `local-ai backends install diffusers` (or via the web UI's Backends page).
+- **Updates**: `bash /opt/localai/update.sh` re-downloads the LocalAI binary; backends persist across binary updates.
 
 ## Requirements
 
@@ -63,7 +61,7 @@ Force a mode with env: `GPU=no bash ct/localai.sh` (CPU-only) or `GPU=yes` (fail
 
 Two supported paths:
 
-- **In-container:** `bash /opt/localai/update.sh` — re-downloads the latest LocalAI release binary, swaps it in atomically, restarts the service. Model configs untouched.
+- **In-container:** `bash /opt/localai/update.sh` — re-downloads the latest LocalAI release binary, swaps it in atomically, restarts the service. Model configs and installed backends untouched.
 - **Host side:** re-run the ct script — it detects the existing installation and runs the update path (community-scripts `update_script()` convention, so the post-install helper's "Update" option works too).
 
 ## Using it
@@ -74,10 +72,10 @@ curl http://<container-ip>:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen2.5-3b-chat","messages":[{"role":"user","content":"Hello"}]}'
 
-# Embeddings
-curl http://<container-ip>:8080/v1/embeddings \
+# Image generation (first call pulls the diffusers backend — multi-GB, one time)
+curl http://<container-ip>:8080/v1/images/generations \
   -H "Content-Type: application/json" \
-  -d '{"model":"text-embedding-ada-002","input":"hello world"}'
+  -d '{"model":"stablediffusion","prompt":"a red apple on a wooden table","size":"512x512"}'
 ```
 
 ## Repo layout
@@ -95,13 +93,13 @@ docs/                       # Script metadata example + design notes
 - **community-scripts compatible**: if [community-scripts/core](https://github.com/community-scripts/core) is available (`COMMUNITY_SCRIPTS_CORE_DIR` or auto-download), its full-featured `build.func` is used — including its own GPU passthrough machinery (`detect_gpu_devices` / `configure_gpu_passthrough` / `fix_gpu_gids`), which this installer deliberately does not duplicate. Otherwise a minimal built-in `core/minimal-build.func` provides the same interface.
 - **GPU passthrough is the engine's job** — earlier versions hand-appended device mounts, which raced with the engine's config writes and caused "GPU not visible" failures. The installer now only sets `var_gpu=yes/no` and verifies visibility after the fact.
 - **Host driver stays on the host** — the container only gets device nodes + userspace libs. Never install a kernel driver inside the LXC.
-- **Why binary, not Docker?** Simpler platform story (no Docker-in-LXC, no toolkit layers), one process to manage. The trade-off — no Python backends — is stated honestly above; users needing image-gen/TTS can run the Docker image inside this container or elsewhere.
+- **Why the binary, not the Docker image?** Simpler platform story (no Docker-in-LXC, no toolkit layers, one process to manage) and backends are now fetched by LocalAI itself anyway, so the Docker image's main advantage (pre-bundled backends) is gone. Trade-off: backend OCI pulls happen over the network on first use rather than being pre-baked — see [How backends work](#how-backends-work-no-docker-required).
 - Inspired by the structure of [community-scripts/ProxmoxVE](https://github.com/community-scripts/ProxmoxVE) (MIT).
 
 ## Roadmap
 
 - [ ] Frontend JSON metadata (community-scripts website listing format)
-- [ ] Optional Docker-image deployment variant (opt-in flag) for image-gen/TTS
+- [ ] Optional backend pre-install prompt at install time (diffusers / piper / whisper)
 - [ ] Model pre-download prompt at install time
 
 ## License
