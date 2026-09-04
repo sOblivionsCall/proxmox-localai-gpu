@@ -1,0 +1,23 @@
+{
+  "name": "Proxmox LocalAI GPU Node",
+  "tagline": "LocalAI LXC for Proxmox VE with automatic NVIDIA/AMD/Intel GPU passthrough — LLMs, image generation, TTS/STT on OpenAI-compatible APIs",
+  "description": "One-command Proxmox VE LXC installer for LocalAI with hardware GPU acceleration. Detects NVIDIA, AMD (ROCm), and Intel GPUs, installs matching userspace runtimes, and deploys LocalAI as a systemd service with an OpenAI-compatible API (/v1). Supports LLM chat, image generation (diffusers / stable-diffusion), embeddings, TTS and STT endpoints. Model configs live in a bind-mounted /opt/localai/models directory for easy editing.",
+  "features": [
+    "Auto-detects NVIDIA / AMD / Intel GPUs and installs matching runtimes",
+    "OpenAI-compatible API on port 8080 (/v1/chat/completions, /v1/images/generations, /v1/audio/*, /v1/embeddings)",
+    "Model configs in /opt/localai/models — drop-in YAML, no restart to edit",
+    "Image generation via diffusers and stablediffusion-ggml backends",
+    "systemd service with auto-restart",
+    "Update script pulls latest LocalAI release from GitHub",
+    "Optional model pre-download on install (small LLM + SD1.5)",
+    "Hardware-accel where the card supports it (CUDA / ROCm / Level Zero)"
+  ],
+  "requires_gpu": true,
+  "recommended_resources": {
+    "cpu": 4,
+    "ram_mb": 8192,
+    "disk_gb": 40
+  },
+  "default_port": 8080,
+  "notes": "NVIDIA cards: host driver required, container gets userspace CUDA via nvidia-container-toolkit. AMD: ROCm userspace. Intel: Level Zero. CPU-only fallback works without any GPU."
+}

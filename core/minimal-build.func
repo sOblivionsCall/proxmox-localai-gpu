@@ -1,0 +1,150 @@
+# Minimal build.func — self-contained fallback for ct/localai.sh
+#
+# Mirrors the subset of community-scripts/core build.func that our installer
+# needs. If community-scripts/core is available it is used instead (see
+# ct/localai.sh), giving you the full-featured version. This fallback exists
+# so the repo works standalone with zero external dependencies.
+#
+# Functions provided: header_info, variables, color, catch_errors, start,
+# build_container, description, msg_info/msg_ok/msg_warn/msg_error, and the
+# shell-color vars.
+
+# ── Colors ──────────────────────────────────────────────────────────────────
+GN=$(echo -e "\033[1;92m")   # green
+CL=$(echo -e "\033[m")       # reset
+BFR="\\r\\033[K"
+HOLD=" "
+CM="${GN}✔${CL}"
+FD="${CL}✖${CL}"
+INFO="${GN}ℹ${CL}"
+YW=$(echo -e "\033[33m")
+BL=$(echo -e "\033[36m")
+RD=$(echo -e "\01[31m") 2>/dev/null || RD=$(echo -e "\033[31m")
+GATEWAY="${BL}Portal:${CL}"
+CREATING="${YW}⚙️  Creating${CL}"
+ADVANCED="no"
+
+msg_info()   { echo -e "${YW}[INFO] $*${CL}"; }
+msg_ok()     { echo -e "${GN}[ OK ] $*${CL}"; }
+msg_warn()   { echo -e "${YW}[WARN] $*${CL}"; }
+msg_error()  { echo -e "${RD}[FAIL] $*${CL}"; }
+
+header_info() {
+  clear
+  cat <<'EOF'
+   ____                 _          _    ___  ____
+  / ___| _   _ _ __ ___| | ___ __ / \  |_ _||  _ \
+ | |    | | | | '__/ __| |/ / '__/ _ \  | | | |_) |
+ | |___ | |_| | |  \__ \   <| | / ___ \ | | |  __/
+  \____| \__,_|_|  |___/_|\_\_|/_/   \_\___|_|_|
+   LocalAI + GPU on Proxmox VE LXC
+EOF
+  echo ""
+}
+
+# Interactive prompts (CTID, hostname, resources) — honors env overrides.
+variables() {
+  CTID="${CT_ID:-$(pvesh get /cluster/nextid)}"
+  CTNAME="${CT_NAME:-localai}"
+  HN="${HN:-$CTNAME}"
+  CORES="${CORE_COUNT:-$var_cpu}"
+  RAM="${RAM_SIZE:-$var_ram}"
+  DISK="${DISK_SIZE:-$var_disk}"
+  STORAGE="${STORAGE:-local-lvm}"
+  NETWORK="${BRIDGE:-vmbr0}"
+
+  echo ""
+  msg_info "Container settings"
+  echo "  ID:       $CTID"
+  echo "  Hostname: $HN"
+  echo "  Cores:    $CORES   RAM: ${RAM}MB   Disk: ${DISK}GB"
+  echo "  Storage:  $STORAGE   Bridge: $NETWORK"
+  echo "  Privileged: $([ "$var_unprivileged" = "0" ] && echo yes || echo no)  (GPU passthrough wants privileged or careful device config)"
+  echo ""
+}
+
+color() { :; }   # colors already set above
+catch_errors() { set -Eeuo pipefail; trap 'error_handler $LINENO' ERR; }
+error_handler() {
+  local exit_code=$?
+  msg_error "Script failed at line $1 (exit $exit_code)"
+  exit "$exit_code"
+}
+
+start() {
+  msg_info "Preparing to create the LocalAI LXC container"
+  # Warn if CTID already exists
+  if pct status "$CTID" >/dev/null 2>&1; then
+    msg_error "CT $CTID already exists — choose another CT_ID"
+    exit 1
+  fi
+}
+
+# OS template resolution: ubuntu 24.04 / debian 12 → matching pct template
+template_os() {
+  local os="$1" ver="$2"
+  case "$os" in
+    ubuntu) echo "ubuntu-${ver}-standard_24.04-1_amd64.tar.zst" ;;
+    debian) echo "debian-${ver}-standard_12.7-1_amd64.tar.zst" ;;
+    *) echo "ubuntu-24.04-standard_24.04-1_amd64.tar.zst" ;;
+  esac
+}
+
+build_container() {
+  msg_info "Downloading OS template"
+  local TEMPLATE
+  TEMPLATE=$(template_os "$var_os" "$var_version")
+  if ! pveam list local 2>/dev/null | grep -q "$TEMPLATE"; then
+    pveam update >/dev/null
+    pveam download local "$TEMPLATE" >/dev/null || { msg_error "Template download failed"; exit 1; }
+  fi
+  msg_ok "Template ready: $TEMPLATE"
+
+  msg_info "Creating LXC $CTID ($HN)"
+  local PRIV_FLAG=""
+  [[ "$var_unprivileged" = "0" ]] && PRIV_FLAG="--unprivileged=0" || PRIV_FLAG="--unprivileged=1"
+
+  pct create "$CTID" "local:vztmpl/$TEMPLATE" \
+    --hostname "$HN" \
+    --cores "$CORES" \
+    --memory "$RAM" \
+    --swap 512 \
+    --rootfs "${STORAGE}:${DISK}" \
+    --net0 "name=eth0,bridge=${NETWORK},ip=dhcp" \
+    --features "nesting=1" \
+    $PRIV_FLAG \
+    --start 1 >/dev/null
+
+  # Wait for network
+  sleep 5
+  for i in {1..10}; do
+    if pct exec "$CTID" -- ping -c1 -W2 8.8.8.8 >/dev/null 2>&1; then break; fi
+    sleep 3
+  done
+  msg_ok "Container $CTID created and started"
+
+  # Inject the in-container installer
+  msg_info "Installing LocalAI inside the container (this can take several minutes)"
+  local INSTALLER_URL="${SELF_BASE_URL:-}"
+  local INSTALLER_PATH
+  INSTALLER_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/../install" && pwd)/localai-install.sh"
+  if [[ -f "$INSTALLER_PATH" ]]; then
+    pct push "$CTID" "$INSTALLER_PATH" /tmp/localai-install.sh
+    pct exec "$CTID" -- bash /tmp/localai-install.sh
+  else
+    msg_error "install/localai-install.sh not found next to this script"
+    exit 1
+  fi
+  msg_ok "LocalAI installed"
+}
+
+description() {
+  # Write a friendly MOTD inside the container
+  pct exec "$CTID" -- bash -c "cat > /etc/motd <<'MOTD'
+LocalAI GPU node — https://github.com/mudler/LocalAI
+API:        http://\$(hostname -I | awk '{print \$1}'):8080/v1
+Models:     /opt/localai/models (drop YAML files, they hot-load)
+Service:    systemctl status localai
+Docs:       https://localai.io
+MOTD"
+}
