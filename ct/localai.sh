@@ -12,7 +12,7 @@
 #     LocalAI runs CPU inference — slower but fully functional.
 #
 # Run from the Proxmox HOST shell:
-#   bash -c "$(wget -qLO - https://raw.githubusercontent.com/<you>/proxmox-localai-gpu/main/ct/localai.sh)"
+#   bash -c "$(wget -qLO - https://raw.githubusercontent.com/sOblivionsCall/proxmox-localai-gpu/main/ct/localai.sh)"
 #
 # Env overrides (advanced):
 #   CT_ID=120 CT_NAME=localai bash ct/localai.sh
@@ -58,15 +58,19 @@ fi
 
 # ----------------------------------------------------------------------------
 # Community-scripts build.func integration (host-side scaffolding).
-# If community-scripts/core is present use it; otherwise a minimal built-in
-# scaffolding below keeps this repo self-contained.
+#
+# The engine derives the install-script name from APP: NSAPP=lowercase(APP),
+# var_install="${NSAPP}-install" → "localai-install". It fetches that from
+# COMMUNITY_SCRIPTS_URL, so the base MUST point at THIS repo — otherwise it
+# 404s against ProxmoxVED (which is exactly the failure seen on first run).
 # ----------------------------------------------------------------------------
-BOOT_URL="${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/community-scripts/core/main/core/build.func}"
+REPO_BASE="${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/sOblivionsCall/proxmox-localai-gpu/main}"
+export COMMUNITY_SCRIPTS_URL="$REPO_BASE"
 
 if [[ -n "${COMMUNITY_SCRIPTS_CORE_DIR:-}" && -f "$COMMUNITY_SCRIPTS_CORE_DIR/core/build.func" ]]; then
   source "$COMMUNITY_SCRIPTS_CORE_DIR/core/build.func"
   USE_CS_CORE=1
-elif curl -fsSL "$BOOT_URL" -o /tmp/cs-build.func 2>/dev/null; then
+elif curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/community-scripts/core/main/core/build.func}" -o /tmp/cs-build.func 2>/dev/null; then
   # shellcheck disable=SC1091
   source /tmp/cs-build.func
   USE_CS_CORE=1
@@ -104,10 +108,21 @@ pre_install_gpu_check() {
   fi
 }
 
-function post_create() {
-  # GPU bind-mounts — skipped entirely for CPU-only containers.
-  [[ "$HOST_GPU" == "none" ]] && { msg_ok "CPU-only container — no device mounts needed"; return; }
+# ------------------------------------------------------------------------------
+# GPU device mounts. MUST run before build_container(): the engine's
+# build_container() both creates the container AND runs the in-container
+# installer, so devices have to be in the config before that call. Also
+# configures var_gpu/var_unprivileged for build.func's container settings.
+# ------------------------------------------------------------------------------
+configure_gpu_passthrough() {
+  # CPU-only containers: nothing to mount, unprivileged is correct.
+  [[ "$HOST_GPU" == "none" ]] && return 0
 
+  # Build.func applies var_gpu=... during variables()/build_container() on
+  # the current shell state — but the community-scripts engine additionally
+  # recognizes var_gpu_instance-style settings only through its own paths.
+  # The reliable cross-version approach is direct config appends + a restart
+  # of the (already-created) container, which happens below in post-mount.
   local CTConf="/etc/pve/lxc/${CTID}.conf"
   msg_info "Configuring GPU passthrough for CT ${CTID}"
   if [[ "$HOST_GPU" == "nvidia" ]]; then
@@ -137,10 +152,26 @@ EOF
   fi
 }
 
+# Mounts + restart must happen BEFORE build_container() so the installer
+# inside the container can already see the GPU (nvidia-smi checks, CUDA).
+pre_create_gpu_mounts() {
+  [[ "$HOST_GPU" == "none" ]] && { msg_ok "CPU-only container — no device mounts needed"; return 0; }
+  configure_gpu_passthrough
+  # Restart so the newly added mounts/cgroup rules take effect. The engine's
+  # build_container() starts the container; our config edits need a restart
+  # to apply. If the container doesn't exist yet (first run), this is a no-op.
+  if pct status "$CTID" >/dev/null 2>&1; then
+    pct reboot "$CTID" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+
 start
 pre_install_gpu_check
+# GPU mounts happen inside build_container() via our wrapper below.
+pre_create_gpu_mounts
 build_container
-post_create
 description
 
 msg_ok "Completed successfully!\n"
