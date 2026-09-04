@@ -127,7 +127,11 @@ cat > "$MODELS_DIR/stablediffusion.yaml" <<'EOF'
 name: stablediffusion
 backend: diffusers
 parameters:
-  model: Lykon/DreamShaper
+  # Direct single-file reference — avoids LocalAI v4's gallery artifact
+  # system pulling the ENTIRE DreamShaper repo (20+ GB of XL variants,
+  # inpainting models, LoRAs) before the API will start. Swap in a
+  # huggingface://<repo> reference if you do want full-repo artifacts.
+  model: https://huggingface.co/Lykon/DreamShaper/resolve/main/DreamShaper_8_pruned.safetensors
 step: 25
 diffusers:
   pipeline_type: StableDiffusionPipeline
@@ -158,7 +162,7 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=$LOCALAI_DIR
-ExecStart=$LOCALAI_BIN run --models-path $MODELS_DIR --host 0.0.0.0 --port 8080
+ExecStart=$LOCALAI_BIN run --models-path $MODELS_DIR --address 0.0.0.0:8080
 Environment=MODELS_PATH=$MODELS_DIR
 # Persist backends (GB-sized OCI extractions) and scratch space outside /tmp
 Environment=LOCALAI_BACKENDS_PATH=$BACKENDS_DIR
@@ -180,6 +184,68 @@ msg_ok "localai.service enabled"
 # Persist deployment mode for the updater
 echo "binary" > "$LOCALAI_DIR/deploy-mode"
 msg_ok "Deployment mode persisted: binary"
+
+# ----------------------------------------------------------------------------
+# Welcome banner — at-a-glance status on every LXC console login.
+# ----------------------------------------------------------------------------
+cat > /etc/profile.d/localai-banner.sh <<'BANNER'
+#!/usr/bin/env bash
+# LocalAI status banner — shown on interactive console logins.
+localai_banner() {
+  [[ $- == *i* ]] || return 0
+  local IP CORES CPU_PCT RAM_TOTAL RAM_USED RAM_PCT DISK_TOTAL DISK_USED DISK_PCT
+  local SVC_STATUS BACKENDS MODELS GPU_LINE
+  IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+  CORES=$(nproc)
+  CPU_PCT=$(top -bn1 2>/dev/null | grep '^%Cpu' | awk '{print int(100-$8)}')
+  CPU_PCT=${CPU_PCT:-?}
+  read -r RAM_TOTAL RAM_USED <<< "$(free -m | awk '/^Mem:/{print $2, $3}')"
+  if [[ -n "$RAM_TOTAL" && "$RAM_TOTAL" -gt 0 ]]; then
+    RAM_PCT=$(( RAM_USED * 100 / RAM_TOTAL ))
+    RAM_TOTAL=$(awk -v m="$RAM_TOTAL" 'BEGIN{printf "%.1f", m/1024}')
+    RAM_USED=$(awk -v m="$RAM_USED" 'BEGIN{printf "%.1f", m/1024}')
+  fi
+  read -r DISK_TOTAL DISK_USED DISK_PCT <<< "$(df -h / | awk 'NR==2{print $2, $3, $5}')"
+  if systemctl is-active --quiet localai 2>/dev/null; then
+    SVC_STATUS="running"
+  else
+    SVC_STATUS="STOPPED (systemctl start localai)"
+  fi
+  BACKENDS=0
+  [[ -d /opt/localai/backends ]] && BACKENDS=$(find /opt/localai/backends -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+  MODELS=$(ls /opt/localai/models/*.yaml 2>/dev/null | wc -l)
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    GPU_LINE="  GPU    : $(nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader 2>/dev/null | head -1)"
+  else
+    GPU_LINE="  GPU    : none visible (CPU inference)"
+  fi
+  echo ""
+  cat <<'ART'
+    _       _         _        ___  ___
+   / \   __| | ___ ___| | ___  / _ \/ __|
+  / _ \ / _` |/ __/ _ \ |/ _ \| | | \__ \
+ / ___ \ (_| | (_|  __/ | (_) | |_| |___/
+/_/   \_\__,_|\___\___|_|\___/ \___/|___/
+ART
+  echo ""
+  echo "  URL    : http://${IP}:8080/v1"
+  echo "  Web UI : http://${IP}:8080"
+  echo "  Service: ${SVC_STATUS}"
+  echo "  Models : ${MODELS} configured   Backends: ${BACKENDS} installed"
+  echo "  CPU    : ${CORES} cores @ ${CPU_PCT}% usage"
+  echo "  RAM    : ${RAM_USED} / ${RAM_TOTAL} GB (${RAM_PCT}%)"
+  echo "  Disk   : ${DISK_USED} / ${DISK_TOTAL} (${DISK_PCT})"
+  echo "${GPU_LINE}"
+  echo ""
+  echo "  Config : /opt/localai/models (drop YAMLs — they hot-load)"
+  echo "  Update : bash /opt/localai/update.sh"
+  echo ""
+}
+localai_banner
+unset -f localai_banner
+BANNER
+chmod +x /etc/profile.d/localai-banner.sh
+msg_ok "Welcome banner installed (/etc/profile.d/localai-banner.sh)"
 
 # ----------------------------------------------------------------------------
 # Verification
